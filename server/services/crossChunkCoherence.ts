@@ -1146,6 +1146,79 @@ Return ONLY a JSON validation report:
   return { finalOutput, stitchResult };
 }
 
+// Expand short documents to meet large word targets
+async function expandShortDocument(
+  text: string,
+  lengthConfig: LengthConfig,
+  customInstructions?: string,
+  audienceParameters?: string,
+  rigorLevel?: string
+): Promise<string> {
+  const inputWords = countWords(text);
+  const targetWords = lengthConfig.targetMid;
+  
+  console.log(`[CC] Expanding ${inputWords} words to target ${targetWords} words`);
+  
+  const expansionPrompt = `You are an expert academic writer tasked with EXPANDING a short text into a comprehensive, well-structured document.
+
+ORIGINAL TEXT (${inputWords} words):
+${text}
+
+TARGET LENGTH: ${lengthConfig.targetMin}-${lengthConfig.targetMax} words (aim for ~${targetWords} words)
+
+${customInstructions ? `USER INSTRUCTIONS:\n${customInstructions}\n` : ''}
+${audienceParameters ? `AUDIENCE: ${audienceParameters}\n` : ''}
+${rigorLevel ? `RIGOR LEVEL: ${rigorLevel}\n` : ''}
+
+EXPANSION REQUIREMENTS:
+1. PRESERVE the core thesis and all original claims
+2. ADD supporting arguments, evidence, examples, and elaboration
+3. DEVELOP each point with thorough explanation
+4. STRUCTURE the expanded text with clear sections
+5. MAINTAIN coherence - every addition must support the original argument
+6. DO NOT add filler or padding - every sentence must be substantive
+7. DO NOT contradict or undermine the original claims
+
+CRITICAL: You MUST produce approximately ${targetWords} words. Count your output carefully.
+
+Write the expanded document now:`;
+
+  // Use Claude for expansion - best at following length instructions
+  const expandedText = await callWithFallback(expansionPrompt, Math.min(targetWords * 6, 64000), 0.7);
+  
+  const outputWords = countWords(expandedText);
+  console.log(`[CC] Expansion complete: ${inputWords} → ${outputWords} words (target: ${targetWords})`);
+  
+  // If significantly under target, do a second expansion pass
+  if (outputWords < lengthConfig.targetMin * 0.7) {
+    console.log(`[CC] Output under target, doing second expansion pass...`);
+    
+    const secondPassPrompt = `The following document needs to be EXPANDED further to meet the word count target.
+
+CURRENT DOCUMENT (${outputWords} words):
+${expandedText}
+
+TARGET: ${lengthConfig.targetMin}-${lengthConfig.targetMax} words
+
+Expand this document by:
+1. Adding more detailed examples and case studies
+2. Elaborating on each major point
+3. Adding transitional paragraphs
+4. Developing counterarguments and responses
+5. Including additional supporting evidence
+
+Produce the fully expanded document now:`;
+
+    const secondExpansion = await callWithFallback(secondPassPrompt, Math.min(targetWords * 6, 64000), 0.7);
+    const secondOutputWords = countWords(secondExpansion);
+    console.log(`[CC] Second pass complete: ${outputWords} → ${secondOutputWords} words`);
+    
+    return secondExpansion;
+  }
+  
+  return expandedText;
+}
+
 export interface CCReconstructionResult {
   reconstructedText: string;
   changes: string;
@@ -1176,8 +1249,20 @@ export async function crossChunkReconstruct(
     throw new Error(`Input exceeds maximum of ${MAX_INPUT_WORDS} words (got ${wordCount})`);
   }
   
-  if (wordCount <= TARGET_CHUNK_SIZE) {
-    console.log(`[CC] Short document (${wordCount} words), using single-pass reconstruction`);
+  // Parse and calculate length configuration from custom instructions FIRST
+  // to determine if expansion is requested even for short documents
+  const parsedLength = parseTargetLength(customInstructions);
+  const lengthConfig = calculateLengthConfig(
+    wordCount,
+    parsedLength?.targetMin ?? null,
+    parsedLength?.targetMax ?? null,
+    customInstructions
+  );
+  
+  // For short documents: only skip multi-chunk if NO significant expansion requested
+  // If user wants to expand 76 words to 5000 words, we MUST process it
+  if (wordCount <= TARGET_CHUNK_SIZE && lengthConfig.lengthRatio <= 1.5) {
+    console.log(`[CC] Short document (${wordCount} words), no expansion requested, using single-pass reconstruction`);
     return {
       reconstructedText: text,
       changes: "Document too short for multi-chunk processing, using standard reconstruction",
@@ -1187,14 +1272,23 @@ export async function crossChunkReconstruct(
     };
   }
   
-  // Parse and calculate length configuration from custom instructions
-  const parsedLength = parseTargetLength(customInstructions);
-  const lengthConfig = calculateLengthConfig(
-    wordCount,
-    parsedLength?.targetMin ?? null,
-    parsedLength?.targetMax ?? null,
-    customInstructions
-  );
+  // For short documents WITH expansion requested, we need to actually expand them
+  if (wordCount <= TARGET_CHUNK_SIZE && lengthConfig.lengthRatio > 1.5) {
+    console.log(`[CC] Short document (${wordCount} words) with expansion target ${lengthConfig.targetMin}-${lengthConfig.targetMax} words`);
+    console.log(`[CC] Using expansion-focused reconstruction for ratio ${lengthConfig.lengthRatio.toFixed(2)}x`);
+    
+    // For expansion from short text, use direct LLM expansion
+    const expandedText = await expandShortDocument(text, lengthConfig, customInstructions, audienceParameters, rigorLevel);
+    
+    return {
+      reconstructedText: expandedText,
+      changes: `Expanded from ${wordCount} words to ${countWords(expandedText)} words (target: ${lengthConfig.targetMin}-${lengthConfig.targetMax})`,
+      wasReconstructed: true,
+      adjacentMaterialAdded: "Comprehensive expansion with supporting arguments, examples, and elaboration",
+      originalLimitationsIdentified: `Original ${wordCount} words expanded to meet ${lengthConfig.targetMin}-${lengthConfig.targetMax} word target`,
+      chunksProcessed: 1
+    };
+  }
   
   console.log(`[CC] Starting 3-pass reconstruction for ${wordCount} word document`);
   console.log(`[CC] Length config: target=${lengthConfig.targetMin}-${lengthConfig.targetMax} words, ratio=${lengthConfig.lengthRatio.toFixed(2)}, mode=${lengthConfig.lengthMode}`);
