@@ -2702,6 +2702,77 @@ Structural understanding is always understanding of relationships. Observational
     }
   });
 
+  // Streaming Position List Processing endpoint (SSE)
+  app.post("/api/position-list/stream", async (req: Request, res: Response) => {
+    const { text, customInstructions } = req.body;
+    
+    // Validate BEFORE setting SSE headers
+    if (!text) {
+      return res.status(400).json({ success: false, message: "Text is required" });
+    }
+    
+    // Check if this is actually a position list BEFORE setting SSE headers
+    const { isPositionList, processPositionList } = await import('./services/positionListReconstruction');
+    if (!isPositionList(text)) {
+      return res.status(400).json({ success: false, message: "Input is not a position list format" });
+    }
+    
+    // All validation passed - NOW set up SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    
+    const sendEvent = (event: string, data: any) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    
+    console.log('[Position-List-Stream] Starting streaming position list processing');
+    
+    try {
+      const callbacks = {
+        onProgress: (stage: string, current: number, total: number, message?: string) => {
+          sendEvent('progress', { stage, current, total, message });
+        },
+        onDefenseGenerated: (position: any, defense: string, index: number, total: number) => {
+          sendEvent('defense', {
+            index,
+            total,
+            claim: position.claim,
+            category: position.category,
+            score: position.significanceScore,
+            defense
+          });
+        },
+        onBatchComplete: (batchIndex: number, totalBatches: number) => {
+          sendEvent('batch', { batchIndex, totalBatches });
+        }
+      };
+      
+      const result = await processPositionList(text, customInstructions || '', callbacks);
+      
+      if (result.success) {
+        sendEvent('complete', {
+          success: true,
+          output: result.output,
+          positionsProcessed: result.positionsProcessed,
+          positionsSelected: result.positionsSelected,
+          totalPositions: result.totalPositions
+        });
+      } else {
+        sendEvent('error', { message: result.error || 'Processing failed' });
+      }
+    } catch (error: any) {
+      console.error('[Position-List-Stream] Error:', error);
+      sendEvent('error', { message: error.message || 'An unexpected error occurred' });
+    }
+    
+    // Always send end event so client knows streaming is done
+    sendEvent('end', { done: true });
+    res.end();
+  });
+
   // Text Model Validator endpoint
   app.post("/api/text-model-validator", async (req: Request, res: Response) => {
     try {

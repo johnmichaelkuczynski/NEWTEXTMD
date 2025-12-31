@@ -32,6 +32,22 @@ import CopyButton from "@/components/CopyButton";
 import SendToButton from "@/components/SendToButton";
 import { MathRenderer } from "@/components/MathRenderer";
 
+// Utility function to detect if text is a position list (pipe-delimited format)
+const isPositionList = (text: string): boolean => {
+  const lines = text.trim().split('\n').filter(l => l.trim().length > 0);
+  if (lines.length < 10) return false;
+  
+  let pipeDelimitedCount = 0;
+  for (const line of lines.slice(0, Math.min(20, lines.length))) {
+    const parts = line.split('|').map(p => p.trim());
+    if (parts.length >= 3 && parts[1].length > 10) {
+      pipeDelimitedCount++;
+    }
+  }
+  
+  return pipeDelimitedCount >= lines.slice(0, 20).length * 0.7;
+};
+
 // Utility function to strip markdown formatting from AI outputs
 const stripMarkdown = (text: string): string => {
   if (!text) return text;
@@ -777,7 +793,109 @@ DOES THE AUTHOR USE OTHER AUTHORS TO DEVELOP HIS IDEAS OR TO CLOAK HIS OWN LACK 
     setValidatorLoading(true);
     setValidatorOutput("");
     
-    // Check word count for progress messaging
+    // Check if this is a position list - use streaming endpoint
+    if (isPositionList(validatorInputText)) {
+      setValidatorProgress("Position list detected - streaming defenses...");
+      try {
+        const response = await fetch('/api/position-list/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: validatorInputText,
+            customInstructions: validatorCustomInstructions,
+          }),
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.message || 'Position list processing failed');
+        }
+
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        let streamedOutput = "";
+        let defensesReceived = 0;
+        let totalDefenses = 0;
+
+        if (reader) {
+          let buffer = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            
+            // SSE events are separated by blank lines (\n\n)
+            const events = buffer.split('\n\n');
+            buffer = events.pop() || ""; // Keep incomplete event in buffer
+
+            for (const eventBlock of events) {
+              if (!eventBlock.trim()) continue;
+              
+              const lines = eventBlock.split('\n');
+              let eventData = "";
+              
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  eventData += line.substring(6);
+                }
+              }
+              
+              if (!eventData) continue;
+              
+              try {
+                const data = JSON.parse(eventData);
+                
+                if (data.stage) {
+                  // Progress event
+                  setValidatorProgress(`${data.stage} (${data.current}/${data.total})${data.message ? ': ' + data.message : ''}`);
+                } else if (data.defense !== undefined) {
+                  // Defense event - stream it out
+                  defensesReceived = data.index + 1;
+                  totalDefenses = data.total;
+                  streamedOutput += `\n${'─'.repeat(55)}\nPOSITION ${data.index + 1}/${data.total} [${data.category}] (Score: ${data.score})\n"${data.claim}"\n\nDEFENSE:\n${data.defense}\n`;
+                  setValidatorOutput(streamedOutput);
+                  setValidatorProgress(`Generating defenses... ${defensesReceived}/${totalDefenses}`);
+                } else if (data.batchIndex) {
+                  // Batch complete event
+                  setValidatorProgress(`Batch ${data.batchIndex}/${data.totalBatches} complete`);
+                } else if (data.success !== undefined) {
+                  // Complete event - use the final formatted output
+                  setValidatorOutput(stripMarkdown(data.output));
+                  setObjectionsInputText(stripMarkdown(data.output));
+                  toast({
+                    title: "Position List Complete!",
+                    description: `Processed ${data.positionsProcessed} positions.`,
+                  });
+                } else if (data.done) {
+                  // End event - streaming complete
+                  break;
+                } else if (data.message && !data.stage) {
+                  // Error event
+                  throw new Error(data.message);
+                }
+              } catch (parseError) {
+                // Ignore parse errors for incomplete chunks
+                console.debug('SSE parse error:', parseError);
+              }
+            }
+          }
+        }
+      } catch (error: any) {
+        console.error('Position list streaming error:', error);
+        toast({
+          title: "Processing Failed",
+          description: error.message || "An error occurred during position list processing.",
+          variant: "destructive",
+        });
+      } finally {
+        setValidatorLoading(false);
+        setValidatorProgress("");
+      }
+      return;
+    }
+    
+    // Regular (non-position-list) reconstruction
     const wordCount = validatorInputText.trim().split(/\s+/).length;
     if (wordCount >= 1200 && wordCount <= 25000) {
       setValidatorProgress("Extracting document structure (outline-first mode)...");

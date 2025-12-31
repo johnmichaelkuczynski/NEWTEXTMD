@@ -27,6 +27,12 @@ interface PositionListResult {
   error?: string;
 }
 
+export interface StreamingCallbacks {
+  onProgress?: (stage: string, current: number, total: number, message?: string) => void;
+  onDefenseGenerated?: (position: RankedPosition, defense: string, index: number, total: number) => void;
+  onBatchComplete?: (batchIndex: number, totalBatches: number) => void;
+}
+
 interface DefenseFormat {
   sentenceCount: number | null;
   wordCount: { min: number; max: number } | null;
@@ -332,7 +338,8 @@ Be discriminating - use the full range from 20-95. Reserve 90+ for truly excepti
 async function generateDefenses(
   positions: RankedPosition[],
   customInstructions: string,
-  format: DefenseFormat
+  format: DefenseFormat,
+  callbacks?: StreamingCallbacks
 ): Promise<PositionDefense[]> {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -451,11 +458,19 @@ Continue for all positions.`;
         }
       }
 
-      defenses.push({
+      const defenseEntry = {
         position: batch[i],
         defense: defense || 'Defense generation failed for this position.'
-      });
+      };
+      defenses.push(defenseEntry);
+      
+      // Stream this defense out immediately
+      const globalIndex = batchIdx * batchSize + i;
+      callbacks?.onDefenseGenerated?.(batch[i], defenseEntry.defense, globalIndex, positions.length);
     }
+
+    // Notify batch complete
+    callbacks?.onBatchComplete?.(batchIdx + 1, batches.length);
 
     if (batchIdx < batches.length - 1) {
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -468,8 +483,9 @@ Continue for all positions.`;
 export async function processPositionList(
   text: string,
   customInstructions: string = '',
-  onProgress?: (stage: string, current: number, total: number) => void
+  callbacks?: StreamingCallbacks
 ): Promise<PositionListResult> {
+  const onProgress = callbacks?.onProgress;
   console.log('[POSITION-LIST] Starting position list processing');
   console.log(`[POSITION-LIST] Custom instructions: ${customInstructions || 'None'}`);
 
@@ -512,9 +528,9 @@ export async function processPositionList(
     const rankedPositions = await rankPositions(positions, customInstructions, effectiveTarget);
     console.log(`[POSITION-LIST] Selected ${rankedPositions.length} positions`);
 
-    onProgress?.('Generating defenses...', 2, 4);
-    // FIX #9: Pass format to generateDefenses
-    const defenses = await generateDefenses(rankedPositions, customInstructions, format);
+    onProgress?.('Generating defenses...', 2, 4, `Processing ${rankedPositions.length} positions`);
+    // FIX #9: Pass format to generateDefenses with streaming callbacks
+    const defenses = await generateDefenses(rankedPositions, customInstructions, format, callbacks);
     console.log(`[POSITION-LIST] Generated ${defenses.length} defenses`);
 
     onProgress?.('Formatting output...', 3, 4);
