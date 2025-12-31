@@ -3744,38 +3744,57 @@ Remember: NO markdown formatting. Use plain text with CAPS headers only.`;
         const data = await response.json();
         output = data.choices?.[0]?.message?.content || '';
       } else {
-        // Default: Grok (ZHI 5)
-        const response = await fetch('https://api.x.ai/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${process.env.GROK_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'grok-3',
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt }
-            ],
-            max_tokens: 4096,
-            temperature: 0.7,
-          }),
-        });
-        const data = await response.json();
-        
-        // Debug logging for Grok API response
-        if (!response.ok || data.error) {
-          console.error('[Text Model Validator] Grok API error:', JSON.stringify(data, null, 2));
-          throw new Error(data.error?.message || `Grok API returned status ${response.status}`);
+        // Default: Grok (ZHI 5) with automatic fallback to Claude
+        let grokFailed = false;
+        try {
+          const response = await fetch('https://api.x.ai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${process.env.GROK_API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: 'grok-3',
+              messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+              ],
+              max_tokens: 4096,
+              temperature: 0.7,
+            }),
+          });
+          const data = await response.json();
+          
+          // Check for API errors (rate limit, credits exhausted, etc.)
+          if (!response.ok || data.error) {
+            console.error('[Text Model Validator] Grok API error, falling back to Claude:', JSON.stringify(data, null, 2));
+            grokFailed = true;
+          } else {
+            output = data.choices?.[0]?.message?.content || '';
+            
+            console.log(`[Text Model Validator] Grok response length: ${output.length} chars`);
+            
+            if (!output || output.trim() === '') {
+              console.error('[Text Model Validator] Empty response from Grok, falling back to Claude');
+              grokFailed = true;
+            }
+          }
+        } catch (grokError: any) {
+          console.error('[Text Model Validator] Grok API exception, falling back to Claude:', grokError.message);
+          grokFailed = true;
         }
         
-        output = data.choices?.[0]?.message?.content || '';
-        
-        console.log(`[Text Model Validator] Grok response length: ${output.length} chars, first 200: ${output.substring(0, 200)}`);
-        
-        if (!output || output.trim() === '') {
-          console.error('[Text Model Validator] Empty response from Grok API. Full response:', JSON.stringify(data, null, 2));
-          throw new Error('Grok API returned an empty response. Please try again or select a different model.');
+        // Fallback to Claude if Grok failed
+        if (grokFailed) {
+          console.log('[Text Model Validator] Using Claude as fallback');
+          const Anthropic = (await import('@anthropic-ai/sdk')).default;
+          const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+          const response = await anthropic.messages.create({
+            model: 'claude-sonnet-4-20250514',
+            max_tokens: 8000,
+            messages: [{ role: 'user', content: `${systemPrompt}\n\n${userPrompt}` }],
+          });
+          output = response.content[0].type === 'text' ? response.content[0].text : '';
         }
       }
 
