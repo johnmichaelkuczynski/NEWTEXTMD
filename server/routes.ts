@@ -3724,7 +3724,19 @@ Remember: NO markdown formatting. Use plain text with CAPS headers only.`;
           }),
         });
         const data = await response.json();
+        
+        // Debug logging for Grok API response
+        if (!response.ok || data.error) {
+          console.error('[Text Model Validator] Grok API error:', JSON.stringify(data, null, 2));
+          throw new Error(data.error?.message || `Grok API returned status ${response.status}`);
+        }
+        
         output = data.choices?.[0]?.message?.content || '';
+        
+        if (!output || output.trim() === '') {
+          console.error('[Text Model Validator] Empty response from Grok API. Full response:', JSON.stringify(data, null, 2));
+          throw new Error('Grok API returned an empty response. Please try again or select a different model.');
+        }
       }
 
       // If literal truth mode is enabled, apply rule-based softening and verification
@@ -3896,6 +3908,12 @@ Model: ${providerLabels[provider] || provider}`;
       }
       
       parameterHeader += `\n═══════════════════════════════════════════════════\n\n`;
+
+      // SAFETY CHECK: Never return just the parameter header with no actual content
+      if (!output || output.trim() === '') {
+        console.error('[Text Model Validator] CRITICAL: Output is empty after processing');
+        throw new Error('The AI model returned an empty response. Please try again or select a different model.');
+      }
 
       res.json({
         success: true,
