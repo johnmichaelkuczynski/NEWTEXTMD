@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { extractGlobalSkeleton, smartChunk, reconstructChunkConstrained, stitchAndValidate, parseTargetLength, calculateLengthConfig } from './crossChunkCoherence';
 
 interface DocumentSection {
   id: number;
@@ -697,6 +698,156 @@ IMPORTANT: Every objection number must appear as a key with at least one section
   }
 }
 
+/**
+ * COHERENT OBJECTION-PROOF REWRITE
+ * Uses the text-level coherence functionality (global skeleton + cross-chunk)
+ * instead of raw section-by-section rewriting
+ */
+async function coherentObjectionProofRewrite(
+  originalText: string,
+  objectionsOutput: string,
+  objections: ParsedObjection[],
+  customInstructions: string | undefined,
+  onProgress?: ProgressCallback
+): Promise<ObjectionProofResult> {
+  const totalWords = countWords(originalText);
+  
+  console.log(`[COHERENT-OBJECTION-PROOF] Starting coherent rewrite using text-level coherence`);
+  
+  try {
+    // PHASE 1: Extract Global Skeleton from the document
+    onProgress?.('skeleton', 1, 5, 'Extracting document structure (global skeleton)...');
+    console.log(`[COHERENT-OBJECTION-PROOF] Phase 1: Extracting global skeleton`);
+    
+    const skeleton = await extractGlobalSkeleton(originalText);
+    console.log(`[COHERENT-OBJECTION-PROOF] Skeleton extracted: ${skeleton.thesis.substring(0, 100)}...`);
+    
+    // PHASE 2: Create smart chunks for processing
+    onProgress?.('chunking', 2, 5, 'Creating coherent document chunks...');
+    console.log(`[COHERENT-OBJECTION-PROOF] Phase 2: Smart chunking`);
+    
+    const chunkBoundaries = smartChunk(originalText);
+    console.log(`[COHERENT-OBJECTION-PROOF] Created ${chunkBoundaries.length} smart chunks`);
+    
+    // PHASE 3: Prepare objection context for reconstruction
+    onProgress?.('preparing', 3, 5, 'Preparing objection context...');
+    
+    // Build objection summary for AI context
+    const devastatingObjs = objections.filter(o => o.severity === 'devastating');
+    const forcefulObjs = objections.filter(o => o.severity === 'forceful');
+    const minorObjs = objections.filter(o => o.severity === 'minor');
+    
+    const objectionContext = `
+CRITICAL OBJECTIONS TO ADDRESS IN THIS REWRITE:
+
+${devastatingObjs.length > 0 ? `DEVASTATING OBJECTIONS (MUST address these):
+${devastatingObjs.map(o => `- #${o.number}: ${o.objection.substring(0, 200)}
+  RESPONSE TO INTEGRATE: ${o.response.substring(0, 300)}`).join('\n')}
+` : ''}
+${forcefulObjs.length > 0 ? `FORCEFUL OBJECTIONS (should address):
+${forcefulObjs.slice(0, 10).map(o => `- #${o.number}: ${o.objection.substring(0, 150)}`).join('\n')}
+` : ''}
+${minorObjs.length > 0 ? `MINOR OBJECTIONS (address where natural):
+${minorObjs.slice(0, 5).map(o => `- #${o.number}: ${o.objection.substring(0, 100)}`).join('\n')}
+` : ''}
+
+REWRITE INSTRUCTION: Strengthen the text by integrating responses to these objections as confident assertions. Do NOT use hedging language like "though we acknowledge" or "while recognizing". Assert the responses as established facts.`;
+    
+    // Inject objection context into skeleton's userInstructions
+    const enhancedSkeleton = {
+      ...skeleton,
+      userInstructions: {
+        ...skeleton.userInstructions,
+        customInstructions: `${customInstructions || ''}\n\n${objectionContext}`
+      }
+    };
+    
+    // PHASE 4: Reconstruct each chunk with coherence constraints
+    onProgress?.('rewriting', 4, 5, 'Reconstructing with cross-chunk coherence...');
+    console.log(`[COHERENT-OBJECTION-PROOF] Phase 4: Cross-chunk constrained reconstruction`);
+    
+    // Parse target length if specified and build full LengthConfig
+    const parsedTargets = parseTargetLength(customInstructions);
+    const lengthConfig = calculateLengthConfig(
+      totalWords,
+      parsedTargets?.targetMin ?? null,
+      parsedTargets?.targetMax ?? null,
+      customInstructions ?? null
+    );
+    
+    console.log(`[COHERENT-OBJECTION-PROOF] Length config: ${lengthConfig.targetMin}-${lengthConfig.targetMax} words, ratio ${lengthConfig.lengthRatio.toFixed(2)}`);
+    
+    const processedChunks: { text: string; delta: any }[] = [];
+    
+    for (let i = 0; i < chunkBoundaries.length; i++) {
+      const chunk = chunkBoundaries[i];
+      
+      onProgress?.('rewriting', 4, 5, `Rewriting chunk ${i + 1}/${chunkBoundaries.length}...`);
+      
+      const { outputText, delta } = await reconstructChunkConstrained(
+        chunk.text,
+        i,
+        chunkBoundaries.length,
+        enhancedSkeleton,
+        undefined, // contentAnalysis
+        undefined, // targetOutputWords - let lengthConfig determine
+        undefined, // onCheckpoint
+        lengthConfig
+      );
+      
+      processedChunks.push({ text: outputText, delta });
+      
+      console.log(`[COHERENT-OBJECTION-PROOF] Chunk ${i + 1} complete: ${countWords(outputText)} words`);
+      
+      if (i < chunkBoundaries.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+    
+    // PHASE 5: Stitch and validate final output
+    onProgress?.('finalizing', 5, 5, 'Stitching and validating coherence...');
+    console.log(`[COHERENT-OBJECTION-PROOF] Phase 5: Stitching and validation`);
+    
+    const { finalOutput, stitchResult } = await stitchAndValidate(enhancedSkeleton, processedChunks);
+    const finalWordCount = countWords(finalOutput);
+    
+    console.log(`[COHERENT-OBJECTION-PROOF] Complete: ${finalWordCount} words (target: ${lengthConfig.targetMin}-${lengthConfig.targetMax})`);
+    
+    const summary = `
+${'═'.repeat(60)}
+COHERENT OBJECTION-PROOF PROCESSING SUMMARY
+${'═'.repeat(60)}
+Method: Text-Level Coherence (Global Skeleton + Cross-Chunk)
+Original: ${totalWords} words | Final: ${finalWordCount} words
+Target: ${lengthConfig.targetMin}-${lengthConfig.targetMax} words
+Chunks processed: ${chunkBoundaries.length}
+Objections addressed: ${devastatingObjs.length} devastating, ${forcefulObjs.length} forceful, ${minorObjs.length} minor
+${'═'.repeat(60)}`;
+
+    return {
+      success: true,
+      output: finalOutput + summary,
+      sectionsProcessed: chunkBoundaries.length,
+      objectionsAddressed: objections.length,
+      objectionBreakdown: { 
+        devastating: devastatingObjs.length, 
+        forceful: forcefulObjs.length, 
+        minor: minorObjs.length 
+      }
+    };
+    
+  } catch (error: any) {
+    console.error("[COHERENT-OBJECTION-PROOF] Error:", error);
+    return {
+      success: false,
+      output: '',
+      sectionsProcessed: 0,
+      objectionsAddressed: 0,
+      error: `Coherent rewrite failed: ${error.message}`
+    };
+  }
+}
+
 function mapObjectionsToSectionsFallback(
   sections: DocumentSection[],
   objections: ParsedObjection[]
@@ -1095,7 +1246,7 @@ export async function generateOutlineFirstObjectionProof(
       return formatPreservingRewrite(originalText, objectionsOutput, inputFormat, customInstructions, onProgress);
     }
     
-    onProgress?.('init', 0, 4, `Processing ${totalWords} word document...`);
+    onProgress?.('init', 0, 5, `Processing ${totalWords} word document...`);
     
     const objections = parseObjections(objectionsOutput);
     console.log(`[OBJECTION-PROOF] Parsed ${objections.length} objections`);
@@ -1110,6 +1261,19 @@ export async function generateOutlineFirstObjectionProof(
       };
     }
     
+    // USE COHERENT REWRITE - leverages text-level coherence infrastructure
+    // (global skeleton + smart chunking + cross-chunk reconstruction)
+    console.log(`[OBJECTION-PROOF] Using coherent rewrite with cross-chunk coherence infrastructure`);
+    return coherentObjectionProofRewrite(
+      originalText,
+      objectionsOutput,
+      objections,
+      customInstructions,
+      onProgress
+    );
+    
+    // LEGACY SECTION-BASED APPROACH (preserved for reference/fallback)
+    /*
     onProgress?.('structure', 1, 4, 'Creating document sections...');
     let sections = createDeterministicSections(originalText);
     console.log(`[OBJECTION-PROOF] Created ${sections.length} sections`);
@@ -1195,6 +1359,7 @@ ${'═'.repeat(60)}`;
       sections: sectionInfo,
       objectionBreakdown: { devastating: finalDevastatingCount, forceful: finalForcefulCount, minor: minorCount }
     };
+    */
     
   } catch (error: any) {
     console.error("[OBJECTION-PROOF] Fatal error:", error);
