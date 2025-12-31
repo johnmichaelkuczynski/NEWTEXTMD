@@ -3121,12 +3121,18 @@ Do NOT add academic bloat or decorative language.
 
 CRITICAL: NO markdown formatting (no # headers, no ** bold **, no * italics *). Use plain text only.`;
         
+          // If user has specific instructions like "write one paragraph", prioritize that
+          const hasSpecificOutputInstruction = customInstructions && 
+            /\b(write|one|paragraph|sentence|brief|short|long|expand|words?)\b/i.test(customInstructions);
+          
           userPrompt = `AGGRESSIVELY RECONSTRUCT THIS TEXT
 
 ${text}
 
 ${targetDomain ? `Domain: ${targetDomain}` : ''}
-${customInstructions ? `\nUser instructions: ${customInstructions}` : ''}
+${customInstructions ? `\n**PRIORITY USER INSTRUCTIONS (MUST FOLLOW)**: ${customInstructions}` : ''}
+
+${hasSpecificOutputInstruction ? `\nIMPORTANT: The user has given specific output format instructions above. Follow them EXACTLY. If they asked for one paragraph, output ONE paragraph. Do not add outlines or extra structure unless requested.\n` : ''}
 
 Fix every problem you find:
 - Vague claims → specific claims
@@ -3634,7 +3640,15 @@ Remember: NO markdown formatting. Use plain text with CAPS headers only.`;
       }
 
       // Call the AI model (support multiple providers, default to Grok/ZHI 5)
-      const provider = llmProvider || 'zhi5'; // Default to Grok (ZHI 5)
+      // For very short documents (<100 words), use Claude for better instruction-following
+      const inputWordCount = text.trim().split(/\s+/).length;
+      let provider = llmProvider || 'zhi5'; // Default to Grok (ZHI 5)
+      
+      if (inputWordCount < 100 && !llmProvider) {
+        provider = 'zhi2'; // Use Claude for short documents - better instruction following
+        console.log(`[Text Model Validator] Short document (${inputWordCount} words) - using Claude for better quality`);
+      }
+      
       let output = '';
       
       console.log(`[Text Model Validator] Using provider: ${provider}`);
@@ -3732,6 +3746,8 @@ Remember: NO markdown formatting. Use plain text with CAPS headers only.`;
         }
         
         output = data.choices?.[0]?.message?.content || '';
+        
+        console.log(`[Text Model Validator] Grok response length: ${output.length} chars, first 200: ${output.substring(0, 200)}`);
         
         if (!output || output.trim() === '') {
           console.error('[Text Model Validator] Empty response from Grok API. Full response:', JSON.stringify(data, null, 2));
