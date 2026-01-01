@@ -17,8 +17,8 @@ let _openai: OpenAI | null = null;
 function getAnthropic() { if (!_anthropic) _anthropic = new Anthropic(); return _anthropic; }
 function getOpenAI() { if (!_openai) _openai = new OpenAI(); return _openai; }
 
-const PRIMARY_MODEL = "claude-sonnet-4-5-20250929";
-const FALLBACK_MODEL = "gpt-4-turbo";
+const PRIMARY_MODEL = "gpt-4o";
+const FALLBACK_MODEL = "claude-sonnet-4-5-20250929";
 
 const MAX_INPUT_WORDS = 100000; // Support up to 100k words
 const TARGET_CHUNK_SIZE = 800; // Larger chunks = fewer API calls = more coherent output
@@ -525,36 +525,35 @@ async function callWithFallback(
   
   for (let attempt = 0; attempt <= MAX_TRUNCATION_RETRIES; attempt++) {
     try {
-      const message = await getAnthropic().messages.create({
+      // Primary: OpenAI GPT-4 Turbo
+      const completion = await getOpenAI().chat.completions.create({
         model: PRIMARY_MODEL,
-        max_tokens: currentMaxTokens,
+        max_tokens: Math.min(currentMaxTokens, GPT_MAX_OUTPUT_TOKENS),
         temperature,
         messages: [{ role: "user", content: prompt }]
       });
       
-      const text = message.content[0].type === 'text' ? message.content[0].text : '';
-      const stopReason = message.stop_reason;
+      const text = completion.choices[0]?.message?.content || '';
+      const finishReason = completion.choices[0]?.finish_reason;
       
       // Check if truncated due to max_tokens
-      if (stopReason === 'max_tokens') {
-        if (retryOnTruncation && attempt < MAX_TRUNCATION_RETRIES && currentMaxTokens < SDK_SAFE_MAX_TOKENS) {
-          // Increase up to SDK safe limit only
-          const nextTokens = Math.min(currentMaxTokens * 2, SDK_SAFE_MAX_TOKENS);
+      if (finishReason === 'length') {
+        if (retryOnTruncation && attempt < MAX_TRUNCATION_RETRIES && currentMaxTokens < GPT_MAX_OUTPUT_TOKENS) {
+          const nextTokens = Math.min(currentMaxTokens * 2, GPT_MAX_OUTPUT_TOKENS);
           if (nextTokens > currentMaxTokens) {
             console.log(`[CC] Output truncated (hit max_tokens: ${currentMaxTokens}). Increasing to ${nextTokens} and retrying...`);
             currentMaxTokens = nextTokens;
             continue;
           }
         }
-        // We've hit the SDK safe limit - return what we have rather than fail
-        console.log(`[CC] Output truncated at SDK limit (${currentMaxTokens}). Returning partial output.`);
+        console.log(`[CC] Output truncated at GPT limit (${currentMaxTokens}). Returning partial output.`);
         return text;
       }
       
       // Check for text-based truncation indicators
       const textTruncated = isOutputTruncated(text);
-      if (textTruncated && retryOnTruncation && attempt < MAX_TRUNCATION_RETRIES && currentMaxTokens < SDK_SAFE_MAX_TOKENS) {
-        const nextTokens = Math.min(Math.floor(currentMaxTokens * 1.5), SDK_SAFE_MAX_TOKENS);
+      if (textTruncated && retryOnTruncation && attempt < MAX_TRUNCATION_RETRIES && currentMaxTokens < GPT_MAX_OUTPUT_TOKENS) {
+        const nextTokens = Math.min(Math.floor(currentMaxTokens * 1.5), GPT_MAX_OUTPUT_TOKENS);
         if (nextTokens > currentMaxTokens) {
           console.log(`[CC] Output appears truncated (text analysis). Increasing to ${nextTokens} and retrying...`);
           currentMaxTokens = nextTokens;
@@ -573,32 +572,32 @@ async function callWithFallback(
       const isRetryable = status === 404 || status === 429 || status === 503 || status === 529;
       
       if (isRetryable) {
-        console.log(`[CC] Claude model error (${status}), falling back to GPT-4 Turbo`);
+        console.log(`[CC] OpenAI error (${status}), falling back to Claude`);
         try {
-          const completion = await getOpenAI().chat.completions.create({
+          const message = await getAnthropic().messages.create({
             model: FALLBACK_MODEL,
-            max_tokens: Math.min(currentMaxTokens, GPT_MAX_OUTPUT_TOKENS),
+            max_tokens: Math.min(currentMaxTokens, SDK_SAFE_MAX_TOKENS),
             temperature,
             messages: [{ role: "user", content: prompt }]
           });
-          const text = completion.choices[0]?.message?.content || '';
-          const finishReason = completion.choices[0]?.finish_reason;
+          const text = message.content[0].type === 'text' ? message.content[0].text : '';
+          const stopReason = message.stop_reason;
           
-          if (finishReason === 'length') {
+          if (stopReason === 'max_tokens') {
             if (retryOnTruncation && attempt < MAX_TRUNCATION_RETRIES) {
-              const nextTokens = Math.min(currentMaxTokens * 2, GPT_MAX_OUTPUT_TOKENS);
+              const nextTokens = Math.min(currentMaxTokens * 2, SDK_SAFE_MAX_TOKENS);
               if (nextTokens > currentMaxTokens) {
-                console.log(`[CC] GPT output truncated. Increasing to ${nextTokens} and retrying...`);
+                console.log(`[CC] Claude output truncated. Increasing to ${nextTokens} and retrying...`);
                 currentMaxTokens = nextTokens;
                 continue;
               }
             }
-            throw new Error(`Output truncated at GPT maximum (${currentMaxTokens}). Document may be too long.`);
+            throw new Error(`Output truncated at Claude maximum (${currentMaxTokens}). Document may be too long.`);
           }
           
           return text;
         } catch (fallbackError: any) {
-          console.error(`[CC] Fallback to GPT-4 also failed:`, fallbackError?.message);
+          console.error(`[CC] Fallback to Claude also failed:`, fallbackError?.message);
           throw fallbackError;
         }
       }
