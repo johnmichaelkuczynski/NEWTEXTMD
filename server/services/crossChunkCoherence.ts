@@ -510,6 +510,8 @@ You must significantly expand this chunk with substantive additions.
 // Maximum tokens Claude supports for output
 const CLAUDE_MAX_OUTPUT_TOKENS = 64000; // Claude 3.5 Sonnet supports up to 64k output tokens
 const GPT_MAX_OUTPUT_TOKENS = 16384; // GPT-4 Turbo supports 16k output
+// SDK's non-streaming limit: maxTokens > 21333 triggers "streaming recommended" error
+const SDK_SAFE_MAX_TOKENS = 20000;
 
 async function callWithFallback(
   prompt: string,
@@ -518,45 +520,46 @@ async function callWithFallback(
   retryOnTruncation: boolean = true
 ): Promise<string> {
   const MAX_TRUNCATION_RETRIES = 3;
-  let currentMaxTokens = maxTokens;
+  // Cap initial tokens at SDK safe limit to avoid non-streaming errors
+  let currentMaxTokens = Math.min(maxTokens, SDK_SAFE_MAX_TOKENS);
   
   for (let attempt = 0; attempt <= MAX_TRUNCATION_RETRIES; attempt++) {
     try {
-      // Use longer timeout for large token requests (30 minutes max)
-      const timeoutMs = Math.min(currentMaxTokens * 100, 30 * 60 * 1000);
       const message = await getAnthropic().messages.create({
         model: PRIMARY_MODEL,
-        max_tokens: Math.min(currentMaxTokens, CLAUDE_MAX_OUTPUT_TOKENS),
+        max_tokens: currentMaxTokens,
         temperature,
         messages: [{ role: "user", content: prompt }]
-      }, { timeout: timeoutMs });
+      });
       
       const text = message.content[0].type === 'text' ? message.content[0].text : '';
       const stopReason = message.stop_reason;
       
       // Check if truncated due to max_tokens
       if (stopReason === 'max_tokens') {
-        if (retryOnTruncation && attempt < MAX_TRUNCATION_RETRIES) {
-          // Double the token limit for next attempt (no hard cap below model max)
-          const nextTokens = Math.min(currentMaxTokens * 2, CLAUDE_MAX_OUTPUT_TOKENS);
+        if (retryOnTruncation && attempt < MAX_TRUNCATION_RETRIES && currentMaxTokens < SDK_SAFE_MAX_TOKENS) {
+          // Increase up to SDK safe limit only
+          const nextTokens = Math.min(currentMaxTokens * 2, SDK_SAFE_MAX_TOKENS);
           if (nextTokens > currentMaxTokens) {
             console.log(`[CC] Output truncated (hit max_tokens: ${currentMaxTokens}). Increasing to ${nextTokens} and retrying...`);
             currentMaxTokens = nextTokens;
             continue;
           }
         }
-        // We've hit the model's maximum - this is a hard failure
-        console.error(`[CC] CRITICAL: Output truncated even at max tokens (${currentMaxTokens}). Content too long for model.`);
-        throw new Error(`Output truncated at maximum token limit (${currentMaxTokens}). Document may be too long.`);
+        // We've hit the SDK safe limit - return what we have rather than fail
+        console.log(`[CC] Output truncated at SDK limit (${currentMaxTokens}). Returning partial output.`);
+        return text;
       }
       
       // Check for text-based truncation indicators
       const textTruncated = isOutputTruncated(text);
-      if (textTruncated && retryOnTruncation && attempt < MAX_TRUNCATION_RETRIES) {
-        const nextTokens = Math.min(currentMaxTokens * 1.5, CLAUDE_MAX_OUTPUT_TOKENS);
-        console.log(`[CC] Output appears truncated (text analysis). Increasing to ${nextTokens} and retrying...`);
-        currentMaxTokens = nextTokens;
-        continue;
+      if (textTruncated && retryOnTruncation && attempt < MAX_TRUNCATION_RETRIES && currentMaxTokens < SDK_SAFE_MAX_TOKENS) {
+        const nextTokens = Math.min(Math.floor(currentMaxTokens * 1.5), SDK_SAFE_MAX_TOKENS);
+        if (nextTokens > currentMaxTokens) {
+          console.log(`[CC] Output appears truncated (text analysis). Increasing to ${nextTokens} and retrying...`);
+          currentMaxTokens = nextTokens;
+          continue;
+        }
       }
       
       return text;
@@ -1150,6 +1153,79 @@ Return ONLY a JSON validation report:
 
 // Maximum safe tokens for non-streaming (SDK throws error above ~21k)
 const SAFE_MAX_TOKENS = 16000;
+// Threshold for using sectioned expansion vs simple expansion
+const SECTIONED_EXPANSION_THRESHOLD = 10000;
+
+// Generate an outline for very large documents
+async function generateOutline(
+  text: string,
+  targetWords: number,
+  customInstructions?: string
+): Promise<string[]> {
+  const numSections = Math.ceil(targetWords / 3000); // ~3000 words per section
+  
+  const outlinePrompt = `You are creating a detailed outline for a ${targetWords}-word academic document.
+
+CORE THESIS/CONTENTIONS:
+${text}
+
+${customInstructions ? `USER INSTRUCTIONS: ${customInstructions}` : ''}
+
+Generate exactly ${numSections} chapter/section titles that will comprehensively cover this thesis.
+Each section should be substantial enough for ~3000 words.
+Return ONLY the section titles, one per line, numbered 1-${numSections}.
+No additional text or explanation.`;
+
+  const outlineText = await callWithFallback(outlinePrompt, 2000, 0.5);
+  const sections = outlineText.split('\n')
+    .map(line => line.replace(/^\d+[\.\)]\s*/, '').trim())
+    .filter(line => line.length > 5);
+  
+  console.log(`[CC] Generated outline with ${sections.length} sections`);
+  return sections;
+}
+
+// Expand a single section to target word count
+async function expandSection(
+  sectionTitle: string,
+  sectionIndex: number,
+  totalSections: number,
+  originalThesis: string,
+  targetWords: number,
+  customInstructions?: string,
+  previousSections?: string[]
+): Promise<string> {
+  const contextSummary = previousSections && previousSections.length > 0
+    ? `\nPREVIOUS SECTIONS SUMMARY: You have already written ${previousSections.length} sections. Maintain consistency.`
+    : '';
+
+  const sectionPrompt = `You are writing Section ${sectionIndex + 1} of ${totalSections} for an academic document.
+
+SECTION TITLE: ${sectionTitle}
+
+CORE THESIS (the document defends these claims):
+${originalThesis}
+
+${contextSummary}
+
+${customInstructions ? `USER INSTRUCTIONS: ${customInstructions}` : ''}
+
+TARGET LENGTH: Write approximately ${targetWords} words for this section.
+
+REQUIREMENTS:
+1. Begin with the section heading: "## ${sectionTitle}"
+2. Develop this section comprehensively with arguments, evidence, and examples
+3. Maintain academic rigor and substantive content throughout
+4. Every paragraph must advance the thesis
+5. Do NOT add filler or padding
+6. Write the COMPLETE section now:`;
+
+  const sectionText = await callWithFallback(sectionPrompt, SAFE_MAX_TOKENS, 0.7);
+  const sectionWords = countWords(sectionText);
+  console.log(`[CC] Section ${sectionIndex + 1} complete: ${sectionWords} words`);
+  
+  return sectionText;
+}
 
 // Expand short documents to meet large word targets using iterative passes
 async function expandShortDocument(
@@ -1164,58 +1240,129 @@ async function expandShortDocument(
   
   console.log(`[CC] Expanding ${inputWords} words to target ${targetWords} words`);
   
-  // For very large expansions, do it in passes - each pass can add ~2000-3000 words
+  // For very large targets (10k+ words), use sectioned approach
+  if (targetWords >= SECTIONED_EXPANSION_THRESHOLD) {
+    console.log(`[CC] Using SECTIONED expansion for ${targetWords} word target`);
+    
+    // Phase 1: Generate outline
+    const sections = await generateOutline(text, targetWords, customInstructions);
+    const wordsPerSection = Math.ceil(targetWords / sections.length);
+    
+    console.log(`[CC] Generating ${sections.length} sections, ~${wordsPerSection} words each`);
+    
+    // Phase 2: Generate each section
+    const completedSections: string[] = [];
+    
+    for (let i = 0; i < sections.length; i++) {
+      console.log(`[CC] Writing section ${i + 1}/${sections.length}: "${sections[i]}"`);
+      
+      const sectionText = await expandSection(
+        sections[i],
+        i,
+        sections.length,
+        text,
+        wordsPerSection,
+        customInstructions,
+        completedSections.slice(-2) // Provide last 2 sections for context
+      );
+      
+      completedSections.push(sectionText);
+    }
+    
+    // Phase 3: Assemble document with introduction
+    const introPrompt = `Write a compelling 500-word introduction for an academic document with this thesis:
+${text}
+
+${customInstructions ? `USER INSTRUCTIONS: ${customInstructions}` : ''}
+
+The document has ${sections.length} sections: ${sections.join(', ')}.
+Write ONLY the introduction (no section content). Begin with "# Introduction":`;
+
+    const intro = await callWithFallback(introPrompt, 4000, 0.7);
+    
+    // Assemble final document
+    const finalDocument = [intro, ...completedSections].join('\n\n');
+    const finalWords = countWords(finalDocument);
+    
+    console.log(`[CC] Sectioned expansion complete: ${inputWords} → ${finalWords} words (target: ${targetWords})`);
+    return finalDocument;
+  }
+  
+  // For smaller expansions, use iterative passes
   let currentText = text;
   let currentWords = inputWords;
   let passNum = 0;
-  const maxPasses = Math.ceil(targetWords / 2500); // ~2500 words per pass max
+  const maxPasses = Math.max(Math.ceil(targetWords / 2000), 20); // Allow more passes
   
   while (currentWords < lengthConfig.targetMin * 0.9 && passNum < maxPasses) {
     passNum++;
     const wordsNeeded = targetWords - currentWords;
-    const passTarget = Math.min(wordsNeeded, 3000); // Max 3000 words per pass
+    const passTarget = Math.min(wordsNeeded, 2500); // Max 2500 words per pass
     
     console.log(`[CC] Expansion pass ${passNum}: ${currentWords} words → adding ~${passTarget} words`);
     
-    const expansionPrompt = `You are an expert academic writer. Your task is to EXPAND the following text.
+    // For documents that are already large, summarize context instead of including full text
+    const textForPrompt = currentWords > 4000 
+      ? currentText.substring(0, 8000) + "\n\n[...MIDDLE CONTENT PRESERVED...]\n\n" + currentText.substring(currentText.length - 4000)
+      : currentText;
+    
+    const expansionPrompt = `You are an expert academic writer. EXPAND this text by adding ~${passTarget} more words.
 
 CURRENT TEXT (${currentWords} words):
-${currentText}
+${textForPrompt}
 
 ${passNum === 1 ? `ORIGINAL SEED (preserve this thesis): ${text}` : ''}
 
-EXPANSION TARGET: Add approximately ${passTarget} more words to reach closer to ${targetWords} total words.
+TARGET: Add approximately ${passTarget} words to reach ${targetWords} total.
 
-${customInstructions ? `USER INSTRUCTIONS:\n${customInstructions}\n` : ''}
-${audienceParameters ? `AUDIENCE: ${audienceParameters}\n` : ''}
+${customInstructions ? `USER INSTRUCTIONS: ${customInstructions}` : ''}
 
 EXPANSION REQUIREMENTS:
-1. PRESERVE all existing content and the core thesis
-2. ADD supporting arguments, evidence, examples, and elaboration
-3. DEVELOP each major point with thorough explanation
-4. ADD new sections or subsections as appropriate
-5. MAINTAIN coherence - every addition must support the argument
-6. DO NOT add filler - every sentence must be substantive
-7. DO NOT contradict existing claims
+1. PRESERVE the core thesis and existing structure
+2. ADD new supporting arguments, evidence, examples, subsections
+3. DEVELOP each point with thorough explanation
+4. DO NOT add filler - every sentence must be substantive
+5. DO NOT contradict existing claims
 
-OUTPUT: The complete expanded document (not just additions). Write it now:`;
+OUTPUT the COMPLETE expanded document:`;
 
     try {
       const expandedText = await callWithFallback(expansionPrompt, SAFE_MAX_TOKENS, 0.7);
       const newWords = countWords(expandedText);
       
-      if (newWords <= currentWords) {
-        console.log(`[CC] Pass ${passNum} did not expand (${currentWords} → ${newWords}), stopping`);
-        break;
+      // Accept any expansion, even partial
+      if (newWords > currentWords) {
+        currentText = expandedText;
+        currentWords = newWords;
+        console.log(`[CC] Pass ${passNum} complete: now at ${currentWords} words`);
+      } else {
+        console.log(`[CC] Pass ${passNum} did not expand (${currentWords} → ${newWords}), trying different approach`);
+        // Try appending new content instead
+        const appendPrompt = `Write ${passTarget} words of NEW content that continues and elaborates on this thesis:
+${text}
+
+${customInstructions ? `USER INSTRUCTIONS: ${customInstructions}` : ''}
+
+This will be APPENDED to existing content. Do not repeat what's already written.
+Write substantive academic content now:`;
+        
+        const appendedText = await callWithFallback(appendPrompt, SAFE_MAX_TOKENS, 0.7);
+        const appendedWords = countWords(appendedText);
+        
+        if (appendedWords > 100) {
+          currentText = currentText + "\n\n" + appendedText;
+          currentWords = countWords(currentText);
+          console.log(`[CC] Pass ${passNum} appended: now at ${currentWords} words`);
+        } else {
+          console.log(`[CC] Pass ${passNum} append also failed, stopping`);
+          break;
+        }
       }
-      
-      currentText = expandedText;
-      currentWords = newWords;
-      console.log(`[CC] Pass ${passNum} complete: now at ${currentWords} words`);
       
     } catch (error: any) {
       console.error(`[CC] Expansion pass ${passNum} failed: ${error.message}`);
-      break;
+      // Don't break - try next pass
+      continue;
     }
   }
   
